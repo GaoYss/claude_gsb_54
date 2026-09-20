@@ -20,6 +20,7 @@ type seedRepairCase struct {
 	team        string
 	startedAgo  time.Duration
 	finishedAgo time.Duration // 为 0 表示仍在维修中
+	returnedAgo time.Duration // 大于 0 表示误判退回待处理
 	result      string
 	content     string
 	materials   string
@@ -85,11 +86,29 @@ func seed(db *gorm.DB) error {
 	}
 
 	repairs := make([]repair.Repair, 0)
+	flows := make([]fault.FaultFlow, 0)
 	repairRanges := make([][2]int, len(cases))
 	sequences = map[string]int{}
 	for index, item := range cases {
 		device := lamps[item.lampIndex]
+		flt := faults[index]
 		start := len(repairs)
+		// currentStatus 跟踪该故障在演示时间线上的当前状态, 用于推导每次开工的源状态。
+		currentStatus := fault.StatusPending
+
+		// 故障登记轨迹。
+		flows = append(flows, fault.FaultFlow{
+			FaultID:    flt.ID,
+			FaultNo:    flt.FaultNo,
+			LampID:     device.ID,
+			Action:     fault.FlowReported,
+			FromStatus: "",
+			ToStatus:   fault.StatusPending,
+			Operator:   flt.Reporter,
+			Reason:     flt.FaultType + ": " + flt.Description,
+			OccurredAt: flt.ReportedAt,
+		})
+
 		for _, expect := range item.repairs {
 			startedAt := now.Add(-expect.startedAgo)
 			prefix := "WX" + startedAt.Format("20060102")
@@ -97,8 +116,8 @@ func seed(db *gorm.DB) error {
 
 			record := repair.Repair{
 				RepairNo:     fmt.Sprintf("%s%04d", prefix, sequences[prefix]),
-				FaultID:      faults[index].ID,
-				FaultNo:      faults[index].FaultNo,
+				FaultID:      flt.ID,
+				FaultNo:      flt.FaultNo,
 				LampID:       device.ID,
 				LampCode:     device.Code,
 				Repairman:    expect.repairman,
@@ -110,19 +129,106 @@ func seed(db *gorm.DB) error {
 				Materials:    expect.materials,
 				Cost:         expect.cost,
 			}
-			if expect.finishedAgo > 0 {
+			flowStarted := fault.FaultFlow{
+				FaultID:    flt.ID,
+				FaultNo:    flt.FaultNo,
+				RepairNo:   record.RepairNo,
+				LampID:     device.ID,
+				Action:     fault.FlowStarted,
+				FromStatus: currentStatus,
+				ToStatus:   fault.StatusProcessing,
+				Operator:   expect.repairman,
+				Reason:     expect.content,
+				OccurredAt: startedAt,
+			}
+
+			switch {
+			case expect.returnedAgo > 0:
+				// 误判退回: 维修单标记已退回, 故障回到待处理。
+				returnedAt := now.Add(-expect.returnedAgo)
+				returnReason := "现场复核判断有误, 该灯运行正常, 故障不成立, 退回待处理"
+				record.Status = repair.StatusReturned
+				record.ReturnedAt = &returnedAt
+				record.ReturnedBy = expect.repairman
+				record.ReturnReason = returnReason
+				flows = append(flows, flowStarted, fault.FaultFlow{
+					FaultID:    flt.ID,
+					FaultNo:    flt.FaultNo,
+					RepairNo:   record.RepairNo,
+					LampID:     device.ID,
+					Action:     fault.FlowReturned,
+					FromStatus: fault.StatusProcessing,
+					ToStatus:   fault.StatusPending,
+					Operator:   expect.repairman,
+					Reason:     returnReason,
+					OccurredAt: returnedAt,
+				})
+				currentStatus = fault.StatusPending
+			case expect.finishedAgo > 0:
 				finishedAt := now.Add(-expect.finishedAgo)
 				record.FinishedAt = &finishedAt
 				record.Status = repair.StatusFinished
 				record.Result = expect.result
+				toStatus := fault.StatusProcessing
+				if expect.result == repair.ResultFixed {
+					toStatus = fault.StatusRepaired
+				}
+				flows = append(flows, flowStarted, fault.FaultFlow{
+					FaultID:    flt.ID,
+					FaultNo:    flt.FaultNo,
+					RepairNo:   record.RepairNo,
+					LampID:     device.ID,
+					Action:     fault.FlowFinished,
+					FromStatus: fault.StatusProcessing,
+					ToStatus:   toStatus,
+					Operator:   expect.repairman,
+					Reason:     seedFinishReason(expect),
+					OccurredAt: finishedAt,
+				})
+				currentStatus = toStatus
+			default:
+				flows = append(flows, flowStarted)
+				currentStatus = fault.StatusProcessing
 			}
 			repairs = append(repairs, record)
 		}
 		repairRanges[index] = [2]int{start, len(repairs)}
+
+		// 关闭轨迹。
+		if item.closed {
+			closedAt := now.Add(-item.reportedAgo / 2)
+			flows = append(flows, fault.FaultFlow{
+				FaultID:    flt.ID,
+				FaultNo:    flt.FaultNo,
+				LampID:     device.ID,
+				Action:     fault.FlowClosed,
+				FromStatus: fault.StatusRepaired,
+				ToStatus:   fault.StatusClosed,
+				Reason:     "现场已恢复照明并复核确认, 故障闭环",
+				OccurredAt: closedAt,
+			})
+		}
 	}
 	if len(repairs) > 0 {
 		if err := db.Create(&repairs).Error; err != nil {
 			return fmt.Errorf("写入维修记录演示数据失败: %w", err)
+		}
+		// 批量插入后维修记录才有主键, 按维修单号回填轨迹关联 ID。
+		repairIDByNo := make(map[string]uint, len(repairs))
+		for _, record := range repairs {
+			repairIDByNo[record.RepairNo] = record.ID
+		}
+		for index := range flows {
+			if flows[index].RepairNo != "" {
+				if id, ok := repairIDByNo[flows[index].RepairNo]; ok {
+					flows[index].RepairID = &id
+				}
+			}
+		}
+	}
+	if len(flows) > 0 {
+		if err := db.Create(&flows).Error; err != nil {
+			return fmt.Errorf("写入处置轨迹演示数据失败: %w", err)
 		}
 	}
 
@@ -150,8 +256,21 @@ func seed(db *gorm.DB) error {
 		"路灯", len(lamps),
 		"故障", len(faults),
 		"维修记录", len(repairs),
+		"处置轨迹", len(flows),
 	)
 	return nil
+}
+
+// seedFinishReason 组装演示完工轨迹的理由文本。
+func seedFinishReason(expect seedRepairCase) string {
+	result := "结果: " + repair.ResultLabel(expect.result)
+	if expect.content != "" {
+		result += " ；内容: " + expect.content
+	}
+	if expect.materials != "" {
+		result += " ；耗材: " + expect.materials
+	}
+	return result
 }
 
 // buildSeedLamps 生成 6 条道路共 30 盏路灯的台账数据。
@@ -342,6 +461,17 @@ func seedFaultCases() []seedFaultCase {
 				{
 					repairman: "刘志强", team: "市政照明一班", startedAgo: 12 * hour,
 					content: "拆检控制箱, 正在逐路测量回路电流", materials: "万用表、绝缘胶带", cost: 40,
+				},
+			},
+		},
+		{
+			lampIndex: 14, faultType: "灯不亮", level: fault.LevelNormal, source: fault.SourceCitizen,
+			description: "市民反映该灯杆夜间不亮, 登记后派工到场核查", reporter: "李梅",
+			reportedAgo: 20 * hour, status: fault.StatusPending,
+			repairs: []seedRepairCase{
+				{
+					repairman: "陈鹏", team: "市政照明二班", startedAgo: 18 * hour, returnedAgo: 17 * hour,
+					content: "到场核查灯具点亮情况", materials: "", cost: 0,
 				},
 			},
 		},

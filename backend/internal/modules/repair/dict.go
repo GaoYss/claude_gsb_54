@@ -3,6 +3,7 @@ package repair
 var statusLabels = map[string]string{
 	StatusOngoing:  "维修中",
 	StatusFinished: "已完成",
+	StatusReturned: "已退回",
 }
 
 var resultLabels = map[string]string{

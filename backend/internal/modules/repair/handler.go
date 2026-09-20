@@ -117,6 +117,26 @@ func (h *Handler) Finish(c *gin.Context) {
 	response.OK(c, entity)
 }
 
+// Return 退回待处理。
+func (h *Handler) Return(c *gin.Context) {
+	id, err := httpx.ParseID(c, "id")
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	var req ReturnRequest
+	if err := httpx.BindJSON(c, &req); err != nil {
+		response.Fail(c, err)
+		return
+	}
+	entity, err := h.service.Return(c.Request.Context(), id, req)
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	response.OK(c, entity)
+}
+
 // Delete 删除维修记录。
 func (h *Handler) Delete(c *gin.Context) {
 	id, err := httpx.ParseID(c, "id")

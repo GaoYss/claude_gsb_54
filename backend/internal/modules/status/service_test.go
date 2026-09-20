@@ -10,6 +10,7 @@ import (
 	"gorm.io/gorm/logger"
 	"gorm.io/gorm/schema"
 
+	"streetlight/internal/database"
 	"streetlight/internal/modules/fault"
 	"streetlight/internal/modules/lamp"
 	"streetlight/internal/modules/repair"
@@ -21,6 +22,7 @@ type harness struct {
 	faults  *fault.Service
 	repairs *repair.Service
 	status  *status.Service
+	db      *gorm.DB
 }
 
 func newHarness(t *testing.T) *harness {
@@ -36,7 +38,8 @@ func newHarness(t *testing.T) *harness {
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
 
-	require.NoError(t, db.AutoMigrate(&lamp.Lamp{}, &fault.Fault{}, &repair.Repair{}))
+	require.NoError(t, db.AutoMigrate(&lamp.Lamp{}, &fault.Fault{}, &repair.Repair{}, &fault.FaultFlow{}))
+	require.NoError(t, database.EnsureBusinessIndexes(db))
 
 	lampRepository := lamp.NewRepository(db)
 	lampService := lamp.NewService(lampRepository)
@@ -47,12 +50,14 @@ func newHarness(t *testing.T) *harness {
 
 	repairRepository := repair.NewRepository(db)
 	repairService := repair.NewService(repairRepository, faultService)
+	faultService.SetOngoingRepairChecker(repairRepository)
 
 	return &harness{
 		lamps:   lampService,
 		faults:  faultService,
 		repairs: repairService,
 		status:  status.NewService(db, lampRepository, faultRepository, repairRepository),
+		db:      db,
 	}
 }
 
@@ -184,4 +189,92 @@ func TestLampStatusListAndTrack(t *testing.T) {
 
 	_, err = h.status.Track(ctx, status.TrackQuery{})
 	require.Error(t, err, "缺少查询条件时应返回错误")
+}
+
+func TestTrackTimelineIncludesReturnFlow(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	device := h.createLamp(t, "LD-S-201", "学院路")
+	flt := h.createFault(t, device.ID, "灯不亮")
+
+	first, err := h.repairs.Create(ctx, repair.CreateRequest{FaultID: flt.ID, Repairman: "维修工甲"})
+	require.NoError(t, err)
+	_, err = h.repairs.Return(ctx, first.ID, repair.ReturnRequest{
+		Reason:   "到场复核为外接电源跳闸, 灯具无故障",
+		Operator: "班组长",
+	})
+	require.NoError(t, err)
+
+	// 退回后重新开工并完工。
+	second, err := h.repairs.Create(ctx, repair.CreateRequest{FaultID: flt.ID, Repairman: "维修工乙", Content: "二次到场处置"})
+	require.NoError(t, err)
+	_, err = h.repairs.Finish(ctx, second.ID, repair.FinishRequest{Result: repair.ResultFixed})
+	require.NoError(t, err)
+
+	track, err := h.status.Track(ctx, status.TrackQuery{FaultID: flt.ID})
+	require.NoError(t, err)
+
+	// 时间线: 登记 / 开工 / 退回 / 再开工 / 完工, 每次流转的操作人与理由均保留。
+	stages := make([]string, 0, len(track.Timeline))
+	for _, event := range track.Timeline {
+		stages = append(stages, event.Stage)
+	}
+	require.Equal(t,
+		[]string{"reported", "repair_started", "returned", "repair_started", "repair_finished"},
+		stages)
+
+	var returnedEvent *status.TimelineEvent
+	for index := range track.Timeline {
+		if track.Timeline[index].Stage == "returned" {
+			returnedEvent = &track.Timeline[index]
+		}
+	}
+	require.NotNil(t, returnedEvent)
+	require.Equal(t, "班组长", returnedEvent.Operator)
+	require.Contains(t, returnedEvent.Detail, "外接电源跳闸")
+	require.Equal(t, first.RepairNo, returnedEvent.RepairNo)
+	require.Equal(t, "processing", returnedEvent.FromStatus)
+	require.Equal(t, "pending", returnedEvent.ToStatus)
+
+	// flows 原始轨迹也一并返回。
+	require.Len(t, track.Flows, 5)
+
+	// 退回后重新开工, 路灯最终因已修复回到正常。
+	finalLamp, err := h.lamps.Get(ctx, device.ID)
+	require.NoError(t, err)
+	require.Equal(t, lamp.RunStatusNormal, finalLamp.RunStatus)
+
+	// 概览数字: 1 已完成 + 1 已退回, 在办为 0。
+	overview, err := h.status.Overview(ctx)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), overview.Repair.FinishedTotal)
+	require.Equal(t, int64(1), overview.Repair.ReturnedTotal)
+	require.Equal(t, int64(0), overview.Repair.OngoingTotal)
+	require.Equal(t, int64(2), overview.Repair.Total)
+}
+
+func TestTrackTimelineFallsBackForLegacyFault(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	device := h.createLamp(t, "LD-S-202", "滨江路")
+	flt := h.createFault(t, device.ID, "灯不亮")
+
+	// 直接落维修记录但不产生 fault_flow, 模拟功能上线前的旧数据。
+	record, err := h.repairs.Create(ctx, repair.CreateRequest{FaultID: flt.ID, Repairman: "老维修工"})
+	require.NoError(t, err)
+	_, err = h.repairs.Finish(ctx, record.ID, repair.FinishRequest{Result: repair.ResultFixed})
+	require.NoError(t, err)
+
+	// 上面的正常流程已写入轨迹; 这里删除轨迹验证时间线兜底合成。
+	require.NoError(t, h.dbWhereFlowsDeleted(flt.ID))
+
+	track, err := h.status.Track(ctx, status.TrackQuery{FaultID: flt.ID})
+	require.NoError(t, err)
+	require.NotEmpty(t, track.Timeline, "历史数据无轨迹时应回退合成时间线")
+	require.Equal(t, "reported", track.Timeline[0].Stage)
+}
+
+// dbWhereFlowsDeleted 由 status 测试 harness 借助底层连接清空指定故障轨迹(见 newHarness 暴露)。
+func (h *harness) dbWhereFlowsDeleted(faultID uint) error {
+	return h.db.Where("fault_id = ?", faultID).Delete(&fault.FaultFlow{}).Error
 }

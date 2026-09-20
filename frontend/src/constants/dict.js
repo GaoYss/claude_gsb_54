@@ -34,6 +34,7 @@ export const FAULT_SOURCE = {
 export const REPAIR_STATUS = {
   ongoing: { label: '维修中', type: 'warning' },
   finished: { label: '已完成', type: 'success' },
+  returned: { label: '已退回', type: 'info' },
 }
 
 // 维修结果。
@@ -48,7 +49,8 @@ export const REPAIR_RESULT = {
 export const TIMELINE_STAGE = {
   reported: { label: '故障登记', type: 'primary' },
   repair_started: { label: '维修开工', type: 'warning' },
-  repair_finished: { label: '维修完成', type: 'success' },
+  repair_finished: { label: '维修完工', type: 'success' },
+  returned: { label: '退回待处理', type: 'danger' },
   closed: { label: '故障关闭', type: 'info' },
 }
 

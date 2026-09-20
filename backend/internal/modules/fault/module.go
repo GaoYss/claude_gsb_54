@@ -33,7 +33,7 @@ func (m *Module) Repository() *Repository { return m.repository }
 func (m *Module) Name() string { return "故障登记" }
 
 // Models 实现 module.Module 接口。
-func (m *Module) Models() []any { return []any{&Fault{}} }
+func (m *Module) Models() []any { return []any{&Fault{}, &FaultFlow{}} }
 
 // RegisterRoutes 实现 module.Module 接口。
 func (m *Module) RegisterRoutes(api *gin.RouterGroup) {

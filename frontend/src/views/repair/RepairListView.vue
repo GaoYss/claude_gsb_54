@@ -44,6 +44,9 @@
         <el-table-column label="完工时间" width="150">
           <template #default="{ row }">{{ formatDateTime(row.finished_at) }}</template>
         </el-table-column>
+        <el-table-column label="退回时间" width="150">
+          <template #default="{ row }">{{ formatDateTime(row.returned_at) }}</template>
+        </el-table-column>
         <el-table-column label="耗时" width="120">
           <template #default="{ row }">{{ formatDuration(row.duration_minutes) }}</template>
         </el-table-column>
@@ -60,10 +63,20 @@
           <template #default="{ row }">{{ formatMoney(row.cost) }}</template>
         </el-table-column>
         <el-table-column prop="content" label="维修内容" min-width="180" show-overflow-tooltip />
-        <el-table-column label="操作" width="240" fixed="right">
+        <el-table-column label="退回原因" min-width="180" show-overflow-tooltip>
+          <template #default="{ row }">
+            <span v-if="row.status === 'returned'">
+              {{ row.return_reason || '-' }}
+              <span class="text-muted" v-if="row.returned_by">（{{ row.returned_by }}）</span>
+            </span>
+            <span v-else class="text-muted">-</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="300" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" @click="openDetail(row)">故障详情</el-button>
             <el-button v-if="row.status === 'ongoing'" link type="success" @click="openFinish(row)">完成维修</el-button>
+            <el-button v-if="row.status === 'ongoing'" link type="warning" @click="openReturn(row)">退回</el-button>
             <el-button v-if="row.status === 'ongoing'" link type="primary" @click="openEdit(row)">编辑</el-button>
             <el-button link type="danger" @click="handleDelete(row)">删除</el-button>
           </template>
@@ -80,6 +93,7 @@
 
     <RepairFormDialog v-model="formVisible" :model="editing" @saved="handleSaved" />
     <FinishRepairDialog v-model="finishVisible" :model="finishing" @saved="handleSaved" />
+    <ReturnRepairDialog v-model="returnVisible" :model="returning" @saved="handleSaved" />
     <FaultDetailDrawer v-model="detailVisible" :fault-id="activeFaultId" />
   </div>
 </template>
@@ -94,6 +108,7 @@ import StatusTag from '@/components/common/StatusTag.vue'
 import DataPagination from '@/components/common/DataPagination.vue'
 import RepairFormDialog from './components/RepairFormDialog.vue'
 import FinishRepairDialog from './components/FinishRepairDialog.vue'
+import ReturnRepairDialog from './components/ReturnRepairDialog.vue'
 import FaultDetailDrawer from '@/views/fault/components/FaultDetailDrawer.vue'
 import { repairApi } from '@/api/repair'
 import { useDictStore } from '@/stores/dict'
@@ -117,9 +132,11 @@ const { loading, rows, total, query, load, search, reset, changePage, changePage
 const dateRange = ref([])
 const formVisible = ref(false)
 const finishVisible = ref(false)
+const returnVisible = ref(false)
 const detailVisible = ref(false)
 const editing = ref(null)
 const finishing = ref(null)
+const returning = ref(null)
 const activeFaultId = ref(null)
 
 function applyDateRange() {
@@ -150,6 +167,11 @@ function openEdit(row) {
 function openFinish(row) {
   finishing.value = { ...row }
   finishVisible.value = true
+}
+
+function openReturn(row) {
+  returning.value = { ...row }
+  returnVisible.value = true
 }
 
 function openDetail(row) {

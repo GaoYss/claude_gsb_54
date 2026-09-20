@@ -69,7 +69,10 @@
             :timestamp="formatDateTime(event.timestamp)"
             :type="dictType(TIMELINE_STAGE, event.stage)"
           >
-            <div class="timeline-title">{{ event.label }}</div>
+            <div class="timeline-title">
+              {{ event.label }}
+              <el-tag v-if="event.repair_no" size="small" effect="plain" class="timeline-no">{{ event.repair_no }}</el-tag>
+            </div>
             <div class="text-muted">{{ event.operator || '系统' }} · {{ event.detail || '-' }}</div>
           </el-timeline-item>
         </el-timeline>
@@ -215,5 +218,10 @@ onMounted(() => {
 <style scoped>
 .timeline-title {
   font-weight: 600;
+}
+
+.timeline-no {
+  margin-left: 8px;
+  font-weight: 400;
 }
 </style>

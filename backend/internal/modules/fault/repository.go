@@ -11,6 +11,7 @@ import (
 	"gorm.io/gorm"
 
 	"streetlight/internal/apperr"
+	"streetlight/pkg/dbx"
 	"streetlight/pkg/pagination"
 )
 
@@ -38,8 +39,11 @@ func NewRepository(db *gorm.DB) *Repository {
 	return &Repository{db: db}
 }
 
+// DB 暴露底层连接, 供业务层开启跨仓储事务。
+func (r *Repository) DB() *gorm.DB { return r.db }
+
 func (r *Repository) session(ctx context.Context) *gorm.DB {
-	return r.db.WithContext(ctx)
+	return dbx.Session(ctx, r.db)
 }
 
 // Create 新增故障记录。
@@ -109,6 +113,65 @@ func (r *Repository) UpdateColumns(ctx context.Context, id uint, columns map[str
 	}
 	if result.RowsAffected == 0 {
 		return apperr.NotFound("故障记录不存在: id=%d", id)
+	}
+	return nil
+}
+
+// UpdateStatusIf 当前状态命中 expectStatuses 时才更新为 toStatus, 返回是否生效。
+// 用于并发场景下的状态流转: 两人同时操作只有一笔能更新成功。
+func (r *Repository) UpdateStatusIf(ctx context.Context, id uint, expectStatuses []string, toStatus string, columns map[string]any) (bool, error) {
+	if len(columns) == 0 {
+		columns = map[string]any{}
+	}
+	columns["status"] = toStatus
+	result := r.session(ctx).Model(&Fault{}).
+		Where("id = ? AND status IN ?", id, expectStatuses).
+		Updates(columns)
+	if result.Error != nil {
+		return false, fmt.Errorf("更新故障状态失败: %w", result.Error)
+	}
+	return result.RowsAffected > 0, nil
+}
+
+// StartRepair 原子地完成开工落账: 仅当故障状态处于 expectStatuses 时,
+// 置为维修中、累加维修次数、刷新最近维修记录。返回是否生效(并发冲突时为 false)。
+func (r *Repository) StartRepair(ctx context.Context, faultID uint, latestRepairID uint, expectStatuses []string) (bool, error) {
+	result := r.session(ctx).Model(&Fault{}).
+		Where("id = ? AND status IN ?", faultID, expectStatuses).
+		Updates(map[string]any{
+			"status":           StatusProcessing,
+			"repair_count":     gorm.Expr("repair_count + 1"),
+			"latest_repair_id": latestRepairID,
+		})
+	if result.Error != nil {
+		return false, fmt.Errorf("更新故障维修统计失败: %w", result.Error)
+	}
+	return result.RowsAffected > 0, nil
+}
+
+// CreateFlow 追加一条处置流转轨迹, 轨迹只增不改。
+func (r *Repository) CreateFlow(ctx context.Context, entity *FaultFlow) error {
+	if err := r.session(ctx).Create(entity).Error; err != nil {
+		return fmt.Errorf("写入处置轨迹失败: %w", err)
+	}
+	return nil
+}
+
+// ListFlowsByFault 查询某条故障的全部处置轨迹, 按发生时间正序。
+func (r *Repository) ListFlowsByFault(ctx context.Context, faultID uint) ([]FaultFlow, error) {
+	entities := make([]FaultFlow, 0)
+	err := r.session(ctx).Where("fault_id = ?", faultID).
+		Order("occurred_at ASC, id ASC").Find(&entities).Error
+	if err != nil {
+		return nil, fmt.Errorf("查询处置轨迹失败: %w", err)
+	}
+	return entities, nil
+}
+
+// DeleteFlowsByRepair 删除某条维修记录关联的流转轨迹(删除维修记录时调用)。
+func (r *Repository) DeleteFlowsByRepair(ctx context.Context, repairID uint) error {
+	if err := r.session(ctx).Where("repair_id = ?", repairID).Delete(&FaultFlow{}).Error; err != nil {
+		return fmt.Errorf("删除处置轨迹失败: %w", err)
 	}
 	return nil
 }

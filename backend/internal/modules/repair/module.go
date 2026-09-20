@@ -44,6 +44,7 @@ func (m *Module) RegisterRoutes(api *gin.RouterGroup) {
 		group.GET("/:id", m.handler.Get)
 		group.PUT("/:id", m.handler.Update)
 		group.POST("/:id/finish", m.handler.Finish)
+		group.POST("/:id/return", m.handler.Return)
 		group.DELETE("/:id", m.handler.Delete)
 	}
 }

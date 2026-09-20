@@ -21,6 +21,22 @@ var sourceLabels = map[string]string{
 	SourceOther:      "其它",
 }
 
+var flowLabels = map[string]string{
+	FlowReported: "故障登记",
+	FlowStarted:  "维修开工",
+	FlowFinished: "维修完工",
+	FlowReturned: "退回待处理",
+	FlowClosed:   "故障关闭",
+}
+
+// FlowLabel 返回处置流转动作的中文名称。
+func FlowLabel(action string) string {
+	if label, ok := flowLabels[action]; ok {
+		return label
+	}
+	return action
+}
+
 // StatusLabel 返回故障状态的中文名称, 未知取值原样返回。
 func StatusLabel(status string) string {
 	if label, ok := statusLabels[status]; ok {

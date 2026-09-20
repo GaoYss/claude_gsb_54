@@ -11,6 +11,7 @@ import (
 	"gorm.io/gorm"
 
 	"streetlight/internal/apperr"
+	"streetlight/pkg/dbx"
 	"streetlight/pkg/pagination"
 )
 
@@ -37,8 +38,11 @@ func NewRepository(db *gorm.DB) *Repository {
 	return &Repository{db: db}
 }
 
+// DB 暴露底层连接, 供业务层开启跨仓储事务。
+func (r *Repository) DB() *gorm.DB { return r.db }
+
 func (r *Repository) session(ctx context.Context) *gorm.DB {
-	return r.db.WithContext(ctx)
+	return dbx.Session(ctx, r.db)
 }
 
 // Create 新增维修记录。
@@ -49,8 +53,11 @@ func (r *Repository) Create(ctx context.Context, entity *Repair) error {
 	return nil
 }
 
-// CreateWithUniqueNo 生成唯一维修单号并落库, 冲突时自动重试。
+// CreateWithUniqueNo 生成唯一维修单号并落库, 单号冲突时自动重试。
+// 若触发的是在办维修局部唯一索引(fault_id / lamp_id), 不属于单号冲突,
+// 立即原样上抛, 由业务层转换为"已有在办维修"的冲突提示。
 func (r *Repository) CreateWithUniqueNo(ctx context.Context, entity *Repair, prefix string) error {
+	var lastErr error
 	for attempt := 0; attempt < 5; attempt++ {
 		sequence, err := r.NextSequence(ctx, prefix)
 		if err != nil {
@@ -61,11 +68,30 @@ func (r *Repository) CreateWithUniqueNo(ctx context.Context, entity *Repair, pre
 		if err == nil {
 			return nil
 		}
+		lastErr = err
 		if !isUniqueViolation(err) {
 			return err
 		}
+		if !isRepairNoViolation(err) {
+			return err
+		}
+	}
+	if lastErr != nil {
+		return lastErr
 	}
 	return apperr.Conflict("维修单号生成冲突, 请稍后重试")
+}
+
+// isRepairNoViolation 判断唯一冲突是否来自维修单号列(而非在办局部唯一索引)。
+// sqlite: "UNIQUE constraint failed: repair.repair_no";
+// postgres 单号索引为 gorm 自动命名, 冲突信息含 repair_no 列名。
+func isRepairNoViolation(err error) bool {
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "fault_id") || strings.Contains(message, "lamp_id") ||
+		strings.Contains(message, "idx_repair_ongoing") {
+		return false
+	}
+	return strings.Contains(message, "repair_no")
 }
 
 // NextSequence 返回指定前缀下可用的下一个流水号。
@@ -95,6 +121,21 @@ func (r *Repository) Update(ctx context.Context, entity *Repair) error {
 		return fmt.Errorf("更新维修记录失败: %w", err)
 	}
 	return nil
+}
+
+// UpdateStatusIf 当前状态命中 expectStatuses 时才执行局部更新(必须包含 status), 返回是否生效。
+// 用于完工 / 退回的并发互斥: 先到的请求改走状态, 后到的请求 RowsAffected=0 得到冲突提示。
+func (r *Repository) UpdateStatusIf(ctx context.Context, id uint, expectStatuses []string, columns map[string]any) (bool, error) {
+	if len(columns) == 0 {
+		return false, nil
+	}
+	result := r.session(ctx).Model(&Repair{}).
+		Where("id = ? AND status IN ?", id, expectStatuses).
+		Updates(columns)
+	if result.Error != nil {
+		return false, fmt.Errorf("更新维修记录失败: %w", result.Error)
+	}
+	return result.RowsAffected > 0, nil
 }
 
 // Delete 按主键删除维修记录。
@@ -169,6 +210,31 @@ func (r *Repository) GetOngoingByFault(ctx context.Context, faultID uint) (*Repa
 	return &entity, nil
 }
 
+// CountOngoingByLamp 统计某盏路灯当前在办的维修记录数量。
+// 同一盏灯不允许同时挂着两条在办维修, 开工前用它做跨故障校验。
+func (r *Repository) CountOngoingByLamp(ctx context.Context, lampID uint) (int64, error) {
+	var count int64
+	err := r.session(ctx).Model(&Repair{}).
+		Where("lamp_id = ? AND status = ?", lampID, StatusOngoing).
+		Count(&count).Error
+	if err != nil {
+		return 0, fmt.Errorf("统计路灯在办维修记录失败: %w", err)
+	}
+	return count, nil
+}
+
+// CountOngoingByFault 统计某条故障当前在办的维修记录数量, 供故障模块关闭前校验。
+func (r *Repository) CountOngoingByFault(ctx context.Context, faultID uint) (int64, error) {
+	var count int64
+	err := r.session(ctx).Model(&Repair{}).
+		Where("fault_id = ? AND status = ?", faultID, StatusOngoing).
+		Count(&count).Error
+	if err != nil {
+		return 0, fmt.Errorf("统计故障在办维修记录失败: %w", err)
+	}
+	return count, nil
+}
+
 // LatestByFault 查询某条故障最近一次维修记录, 不存在时返回 nil。
 func (r *Repository) LatestByFault(ctx context.Context, faultID uint) (*Repair, error) {
 	var entity Repair
@@ -237,10 +303,12 @@ func (r *Repository) CountFinishedBetween(ctx context.Context, from, to time.Tim
 	return total, nil
 }
 
-// SumCost 汇总维修费用。
+// SumCost 汇总已完成维修的费用(退回作废的记录不计入)。
 func (r *Repository) SumCost(ctx context.Context) (float64, error) {
 	var total float64
-	err := r.session(ctx).Model(&Repair{}).Select("COALESCE(SUM(cost), 0)").Scan(&total).Error
+	err := r.session(ctx).Model(&Repair{}).
+		Where("status = ?", StatusFinished).
+		Select("COALESCE(SUM(cost), 0)").Scan(&total).Error
 	if err != nil {
 		return 0, fmt.Errorf("汇总维修费用失败: %w", err)
 	}
@@ -282,7 +350,7 @@ func (r *Repository) AverageDurationHours(ctx context.Context) (float64, error) 
 func (r *Repository) DistinctValues(ctx context.Context, column string) ([]string, error) {
 	values := make([]string, 0)
 	err := r.session(ctx).Model(&Repair{}).
-		Where(column + " <> ''").
+		Where(column+" <> ''").
 		Distinct().
 		Order(column).
 		Pluck(column, &values).Error

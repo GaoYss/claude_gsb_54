@@ -37,6 +37,13 @@ type FinishRequest struct {
 	Remark     string   `json:"remark" binding:"omitempty,max=255"`
 }
 
+// ReturnRequest 退回待处理请求, 现场判断有误时把在办维修退回, 必须填写退回原因。
+type ReturnRequest struct {
+	Reason     string `json:"reason" binding:"required,max=512"`
+	Operator   string `json:"operator" binding:"omitempty,max=64"`
+	ReturnedAt string `json:"returned_at" binding:"omitempty,max=32"`
+}
+
 // ListQuery 维修记录查询条件。
 type ListQuery struct {
 	pagination.Params
@@ -64,6 +71,7 @@ type Statistics struct {
 	Total             int64   `json:"total"`
 	OngoingTotal      int64   `json:"ongoing_total"`
 	FinishedTotal     int64   `json:"finished_total"`
+	ReturnedTotal     int64   `json:"returned_total"`
 	TotalCost         float64 `json:"total_cost"`
 	AverageCost       float64 `json:"average_cost"`
 	AverageDurationHr float64 `json:"average_duration_hours"`

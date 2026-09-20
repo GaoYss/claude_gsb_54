@@ -44,7 +44,7 @@
         suffix="元"
         icon="Money"
         color="#909399"
-        :hint="`累计维修记录 ${overview.repair.total} 条`"
+        :hint="`已完成 ${overview.repair.finished_total} / 已退回 ${overview.repair.returned_total} / 累计 ${overview.repair.total} 条`"
       />
       <StatCard
         label="今日新增故障"
@@ -144,7 +144,7 @@ const loading = ref(false)
 const emptyOverview = () => ({
   lamp: { total: 0, road_count: 0, by_run_status: {} },
   fault: { total: 0, open_total: 0, by_status: {}, today_reported: 0, overdue_total: 0 },
-  repair: { total: 0, ongoing_total: 0, finished_total: 0, today_finished: 0, average_duration_hours: 0, total_cost: 0 },
+  repair: { total: 0, ongoing_total: 0, finished_total: 0, returned_total: 0, today_finished: 0, average_duration_hours: 0, total_cost: 0 },
   fault_by_type: [],
   fault_by_level: [],
   top_roads: [],

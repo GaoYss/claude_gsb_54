@@ -65,7 +65,7 @@ func IsOpen(status string) bool {
 }
 
 // canTransitTo 校验状态流转是否合法。
-// 待处理 -> 维修中 / 已关闭, 维修中 -> 已修复 / 已关闭, 已修复 -> 已关闭 / 返修(维修中)。
+// 待处理 -> 维修中 / 已关闭, 维修中 -> 已修复 / 已关闭 / 退回待处理, 已修复 -> 已关闭 / 返修(维修中)。
 func canTransitTo(from, to string) bool {
 	if from == to {
 		return true
@@ -74,7 +74,7 @@ func canTransitTo(from, to string) bool {
 	case StatusPending:
 		return to == StatusProcessing || to == StatusClosed
 	case StatusProcessing:
-		return to == StatusRepaired || to == StatusClosed
+		return to == StatusRepaired || to == StatusClosed || to == StatusPending
 	case StatusRepaired:
 		return to == StatusClosed || to == StatusProcessing
 	default:

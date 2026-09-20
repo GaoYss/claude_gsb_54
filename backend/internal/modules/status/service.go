@@ -162,6 +162,7 @@ func (s *Service) Overview(ctx context.Context) (*Overview, error) {
 			Total:             repairTotal,
 			OngoingTotal:      repairByStatus[repair.StatusOngoing],
 			FinishedTotal:     repairByStatus[repair.StatusFinished],
+			ReturnedTotal:     repairByStatus[repair.StatusReturned],
 			TodayFinished:     todayFinished,
 			AverageDurationHr: round2(averageDuration),
 			TotalCost:         round2(totalCost),
@@ -307,6 +308,7 @@ func (s *Service) Track(ctx context.Context, query TrackQuery) (*TrackResult, er
 			SearchType:    "lamp",
 			Lamp:          device,
 			Repairs:       make([]repair.Repair, 0),
+			Flows:         make([]fault.FaultFlow, 0),
 			Timeline:      make([]TimelineEvent, 0),
 			RelatedFaults: toBriefs(history),
 		}
@@ -316,9 +318,14 @@ func (s *Service) Track(ctx context.Context, query TrackQuery) (*TrackResult, er
 			if err != nil {
 				return nil, err
 			}
+			flows, err := s.faults.ListFlowsByFault(ctx, latest.ID)
+			if err != nil {
+				return nil, err
+			}
 			result.Fault = &latest
 			result.Repairs = repairs
-			result.Timeline = buildTimeline(&latest, repairs)
+			result.Flows = flows
+			result.Timeline = buildTimeline(flows, &latest, repairs)
 		}
 		return result, nil
 
@@ -337,12 +344,17 @@ func (s *Service) buildFaultTrack(ctx context.Context, entity *fault.Fault) (*Tr
 	if err != nil {
 		return nil, err
 	}
+	flows, err := s.faults.ListFlowsByFault(ctx, entity.ID)
+	if err != nil {
+		return nil, err
+	}
 	return &TrackResult{
 		SearchType: "fault",
 		Lamp:       device,
 		Fault:      entity,
 		Repairs:    repairs,
-		Timeline:   buildTimeline(entity, repairs),
+		Flows:      flows,
+		Timeline:   buildTimeline(flows, entity, repairs),
 	}, nil
 }
 
@@ -411,50 +423,25 @@ func (s *Service) latestRepairs(ctx context.Context, lampIDs []uint) (map[uint]r
 	return result, nil
 }
 
-// buildTimeline 依据故障与维修记录构建处置时间线。
-func buildTimeline(entity *fault.Fault, repairs []repair.Repair) []TimelineEvent {
-	events := make([]TimelineEvent, 0, len(repairs)*2+2)
-
-	events = append(events, TimelineEvent{
-		Stage:     "reported",
-		Label:     "故障登记",
-		Operator:  entity.Reporter,
-		Detail:    entity.FaultType + ": " + entity.Description,
-		Timestamp: entity.ReportedAt,
-	})
-
-	for _, item := range repairs {
-		events = append(events, TimelineEvent{
-			Stage:     "repair_started",
-			Label:     "维修开工",
-			Operator:  item.Repairman,
-			Detail:    strings.TrimSpace(item.RepairNo + " " + item.Content),
-			Timestamp: item.StartedAt,
-		})
-		if item.FinishedAt != nil {
-			detail := item.RepairNo
-			if item.Result != "" {
-				detail = strings.TrimSpace(detail + " 结果: " + repair.ResultLabel(item.Result))
-			}
-			if item.Materials != "" {
-				detail = strings.TrimSpace(detail + " 耗材: " + item.Materials)
-			}
-			events = append(events, TimelineEvent{
-				Stage:     "repair_finished",
-				Label:     "维修完成",
-				Operator:  item.Repairman,
-				Detail:    detail,
-				Timestamp: *item.FinishedAt,
-			})
-		}
+// buildTimeline 依据处置轨迹构建时间线, 每次流转的操作人与理由都按时间保留。
+// 兼容历史数据: 当 fault_flow 中没有轨迹(功能上线前的旧故障)时,
+// 用故障与维修记录合成一条时间线, 保证老数据的追踪视图不为空。
+func buildTimeline(flows []fault.FaultFlow, entity *fault.Fault, repairs []repair.Repair) []TimelineEvent {
+	if len(flows) == 0 {
+		flows = synthesizeFlows(entity, repairs)
 	}
 
-	if entity.ClosedAt != nil {
+	events := make([]TimelineEvent, 0, len(flows))
+	for _, item := range flows {
 		events = append(events, TimelineEvent{
-			Stage:     "closed",
-			Label:     "故障关闭",
-			Detail:    entity.CloseRemark,
-			Timestamp: *entity.ClosedAt,
+			Stage:      item.Action,
+			Label:      fault.FlowLabel(item.Action),
+			Operator:   item.Operator,
+			Detail:     item.Reason,
+			FromStatus: item.FromStatus,
+			ToStatus:   item.ToStatus,
+			RepairNo:   item.RepairNo,
+			Timestamp:  item.OccurredAt,
 		})
 	}
 
@@ -462,6 +449,91 @@ func buildTimeline(entity *fault.Fault, repairs []repair.Repair) []TimelineEvent
 		return events[i].Timestamp.Before(events[j].Timestamp)
 	})
 	return events
+}
+
+// synthesizeFlows 依据故障与维修记录为没有轨迹表的历史数据合成处置轨迹。
+func synthesizeFlows(entity *fault.Fault, repairs []repair.Repair) []fault.FaultFlow {
+	if entity == nil {
+		return nil
+	}
+	flows := []fault.FaultFlow{{
+		FaultID:    entity.ID,
+		FaultNo:    entity.FaultNo,
+		LampID:     entity.LampID,
+		Action:     fault.FlowReported,
+		ToStatus:   fault.StatusPending,
+		Operator:   entity.Reporter,
+		Reason:     entity.FaultType + ": " + entity.Description,
+		OccurredAt: entity.ReportedAt,
+	}}
+	for _, item := range repairs {
+		repairID := item.ID
+		flows = append(flows, fault.FaultFlow{
+			FaultID:    entity.ID,
+			FaultNo:    entity.FaultNo,
+			RepairID:   &repairID,
+			RepairNo:   item.RepairNo,
+			LampID:     entity.LampID,
+			Action:     fault.FlowStarted,
+			ToStatus:   fault.StatusProcessing,
+			Operator:   item.Repairman,
+			Reason:     item.Content,
+			OccurredAt: item.StartedAt,
+		})
+		switch item.Status {
+		case repair.StatusReturned:
+			occurredAt := item.StartedAt
+			if item.ReturnedAt != nil {
+				occurredAt = *item.ReturnedAt
+			}
+			flows = append(flows, fault.FaultFlow{
+				FaultID:    entity.ID,
+				FaultNo:    entity.FaultNo,
+				RepairID:   &repairID,
+				RepairNo:   item.RepairNo,
+				LampID:     entity.LampID,
+				Action:     fault.FlowReturned,
+				FromStatus: fault.StatusProcessing,
+				ToStatus:   fault.StatusPending,
+				Operator:   item.ReturnedBy,
+				Reason:     item.ReturnReason,
+				OccurredAt: occurredAt,
+			})
+		default:
+			if item.FinishedAt != nil {
+				toStatus := fault.StatusProcessing
+				if item.Result == repair.ResultFixed {
+					toStatus = fault.StatusRepaired
+				}
+				flows = append(flows, fault.FaultFlow{
+					FaultID:    entity.ID,
+					FaultNo:    entity.FaultNo,
+					RepairID:   &repairID,
+					RepairNo:   item.RepairNo,
+					LampID:     entity.LampID,
+					Action:     fault.FlowFinished,
+					FromStatus: fault.StatusProcessing,
+					ToStatus:   toStatus,
+					Operator:   item.Repairman,
+					Reason:     "结果: " + repair.ResultLabel(item.Result),
+					OccurredAt: *item.FinishedAt,
+				})
+			}
+		}
+	}
+	if entity.ClosedAt != nil {
+		flows = append(flows, fault.FaultFlow{
+			FaultID:    entity.ID,
+			FaultNo:    entity.FaultNo,
+			LampID:     entity.LampID,
+			Action:     fault.FlowClosed,
+			FromStatus: fault.StatusRepaired,
+			ToStatus:   fault.StatusClosed,
+			Reason:     entity.CloseRemark,
+			OccurredAt: *entity.ClosedAt,
+		})
+	}
+	return flows
 }
 
 // orderedCounts 按给定顺序输出分组统计, 保证前端展示顺序稳定且包含零值项。

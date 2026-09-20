@@ -48,6 +48,7 @@ type RepairSummary struct {
 	Total             int64   `json:"total"`
 	OngoingTotal      int64   `json:"ongoing_total"`
 	FinishedTotal     int64   `json:"finished_total"`
+	ReturnedTotal     int64   `json:"returned_total"`
 	TodayFinished     int64   `json:"today_finished"`
 	AverageDurationHr float64 `json:"average_duration_hours"`
 	TotalCost         float64 `json:"total_cost"`
@@ -55,8 +56,8 @@ type RepairSummary struct {
 
 // Overview 维修状态总览看板。
 type Overview struct {
-	Lamp          LampSummary  `json:"lamp"`
-	Fault         FaultSummary `json:"fault"`
+	Lamp          LampSummary   `json:"lamp"`
+	Fault         FaultSummary  `json:"fault"`
 	Repair        RepairSummary `json:"repair"`
 	FaultByType   []LabelCount  `json:"fault_by_type"`
 	FaultByLevel  []LabelCount  `json:"fault_by_level"`
@@ -92,11 +93,14 @@ type LampStatusRow struct {
 
 // TimelineEvent 是维修状态追踪中的一个节点。
 type TimelineEvent struct {
-	Stage     string    `json:"stage"`
-	Label     string    `json:"label"`
-	Operator  string    `json:"operator"`
-	Detail    string    `json:"detail"`
-	Timestamp time.Time `json:"timestamp"`
+	Stage      string    `json:"stage"`
+	Label      string    `json:"label"`
+	Operator   string    `json:"operator"`
+	Detail     string    `json:"detail"`
+	FromStatus string    `json:"from_status,omitempty"`
+	ToStatus   string    `json:"to_status,omitempty"`
+	RepairNo   string    `json:"repair_no,omitempty"`
+	Timestamp  time.Time `json:"timestamp"`
 }
 
 // TrackResult 是单条故障(或单盏路灯)的完整处理链路。
@@ -105,6 +109,7 @@ type TrackResult struct {
 	Lamp          *lamp.Lamp        `json:"lamp,omitempty"`
 	Fault         *fault.Fault      `json:"fault,omitempty"`
 	Repairs       []repair.Repair   `json:"repairs"`
+	Flows         []fault.FaultFlow `json:"flows"`
 	Timeline      []TimelineEvent   `json:"timeline"`
 	RelatedFaults []FaultBrief      `json:"related_faults,omitempty"`
 }

@@ -46,7 +46,28 @@ func AutoMigrate(db *gorm.DB, models []any) error {
 	if err := db.AutoMigrate(models...); err != nil {
 		return fmt.Errorf("自动迁移数据表失败: %w", err)
 	}
+	if err := EnsureBusinessIndexes(db); err != nil {
+		return err
+	}
 	slog.Info("数据表迁移完成", "模型数量", len(models))
+	return nil
+}
+
+// EnsureBusinessIndexes 创建自动迁移无法表达的局部唯一索引(幂等)。
+//
+// idx_repair_ongoing_fault / idx_repair_ongoing_lamp 保证:
+// 同一条故障、同一盏路灯, 任意时刻至多存在一条 status='ongoing' 的在办维修。
+// 这是"两人同时操作只有一次生效"在数据库层的最终防线, sqlite 与 postgres 均支持局部唯一索引。
+func EnsureBusinessIndexes(db *gorm.DB) error {
+	statements := []string{
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_repair_ongoing_fault ON repair (fault_id) WHERE status = 'ongoing'`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_repair_ongoing_lamp ON repair (lamp_id) WHERE status = 'ongoing'`,
+	}
+	for _, statement := range statements {
+		if err := db.Exec(statement).Error; err != nil {
+			return fmt.Errorf("创建业务唯一索引失败: %w", err)
+		}
+	}
 	return nil
 }
 

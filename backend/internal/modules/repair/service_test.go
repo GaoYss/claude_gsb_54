@@ -12,6 +12,7 @@ import (
 	"gorm.io/gorm/schema"
 
 	"streetlight/internal/apperr"
+	"streetlight/internal/database"
 	"streetlight/internal/modules/fault"
 	"streetlight/internal/modules/lamp"
 	"streetlight/internal/modules/repair"
@@ -38,7 +39,8 @@ func newHarness(t *testing.T) *harness {
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
 
-	require.NoError(t, db.AutoMigrate(&lamp.Lamp{}, &fault.Fault{}, &repair.Repair{}))
+	require.NoError(t, db.AutoMigrate(&lamp.Lamp{}, &fault.Fault{}, &repair.Repair{}, &fault.FaultFlow{}))
+	require.NoError(t, database.EnsureBusinessIndexes(db))
 
 	lampRepository := lamp.NewRepository(db)
 	lampService := lamp.NewService(lampRepository)
@@ -49,6 +51,7 @@ func newHarness(t *testing.T) *harness {
 
 	repairRepository := repair.NewRepository(db)
 	repairService := repair.NewService(repairRepository, faultService)
+	faultService.SetOngoingRepairChecker(repairRepository)
 
 	return &harness{lamps: lampService, faults: faultService, repairs: repairService, db: db}
 }

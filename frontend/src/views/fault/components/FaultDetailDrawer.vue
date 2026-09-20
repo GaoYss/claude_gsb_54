@@ -49,7 +49,10 @@
             :timestamp="formatDateTime(event.timestamp)"
             :type="dictType(TIMELINE_STAGE, event.stage)"
           >
-            <div class="timeline-title">{{ event.label }}</div>
+            <div class="timeline-title">
+              {{ event.label }}
+              <el-tag v-if="event.repair_no" size="small" effect="plain" class="timeline-no">{{ event.repair_no }}</el-tag>
+            </div>
             <div class="text-muted timeline-detail">{{ event.operator || '系统' }} · {{ event.detail || '-' }}</div>
           </el-timeline-item>
         </el-timeline>
@@ -68,10 +71,12 @@
           <el-table-column label="开工时间" width="140">
             <template #default="{ row }">{{ formatDateTime(row.started_at) }}</template>
           </el-table-column>
-          <el-table-column label="完工时间" width="140">
-            <template #default="{ row }">{{ formatDateTime(row.finished_at) }}</template>
+          <el-table-column label="完工/退回时间" width="140">
+            <template #default="{ row }">{{ formatDateTime(row.finished_at || row.returned_at) }}</template>
           </el-table-column>
-          <el-table-column prop="content" label="维修内容" min-width="160" show-overflow-tooltip />
+          <el-table-column label="维修内容 / 退回原因" min-width="180" show-overflow-tooltip>
+            <template #default="{ row }">{{ row.status === 'returned' ? row.return_reason : row.content }}</template>
+          </el-table-column>
         </el-table>
       </template>
       <el-empty v-else description="暂无故障数据" />
@@ -117,6 +122,11 @@ async function load() {
 
 .timeline-title {
   font-weight: 600;
+}
+
+.timeline-no {
+  margin-left: 8px;
+  font-weight: 400;
 }
 
 .timeline-detail {
