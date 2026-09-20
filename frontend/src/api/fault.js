@@ -8,5 +8,7 @@ export const faultApi = {
   update: (id, data) => request.put(`/faults/${id}`, data),
   remove: (id) => request.delete(`/faults/${id}`),
   close: (id, data) => request.post(`/faults/${id}/close`, data),
+  returnToPending: (id, data) => request.post(`/faults/${id}/return`, data),
+  transitions: (id) => request.get(`/faults/${id}/transitions`),
   meta: () => request.get('/faults/meta'),
 }

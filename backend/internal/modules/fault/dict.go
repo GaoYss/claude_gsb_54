@@ -21,6 +21,22 @@ var sourceLabels = map[string]string{
 	SourceOther:      "其它",
 }
 
+var actionLabels = map[string]string{
+	ActionReported:       "故障登记",
+	ActionRepairStarted:  "维修开工",
+	ActionRepairFinished: "维修完成",
+	ActionReturned:       "退回待处理",
+	ActionClosed:         "故障关闭",
+}
+
+// ActionLabel 返回处置动作的中文名称, 未知取值原样返回。
+func ActionLabel(action string) string {
+	if label, ok := actionLabels[action]; ok {
+		return label
+	}
+	return action
+}
+
 // StatusLabel 返回故障状态的中文名称, 未知取值原样返回。
 func StatusLabel(status string) string {
 	if label, ok := statusLabels[status]; ok {

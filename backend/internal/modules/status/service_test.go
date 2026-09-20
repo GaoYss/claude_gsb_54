@@ -36,7 +36,8 @@ func newHarness(t *testing.T) *harness {
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
 
-	require.NoError(t, db.AutoMigrate(&lamp.Lamp{}, &fault.Fault{}, &repair.Repair{}))
+	require.NoError(t, db.AutoMigrate(&lamp.Lamp{}, &fault.Fault{}, &fault.FaultTransition{}, &repair.Repair{}))
+	require.NoError(t, repair.EnsureIndexes(db))
 
 	lampRepository := lamp.NewRepository(db)
 	lampService := lamp.NewService(lampRepository)
@@ -47,6 +48,7 @@ func newHarness(t *testing.T) *harness {
 
 	repairRepository := repair.NewRepository(db)
 	repairService := repair.NewService(repairRepository, faultService)
+	faultService.SetRepairPort(repairService)
 
 	return &harness{
 		lamps:   lampService,
@@ -184,4 +186,47 @@ func TestLampStatusListAndTrack(t *testing.T) {
 
 	_, err = h.status.Track(ctx, status.TrackQuery{})
 	require.Error(t, err, "缺少查询条件时应返回错误")
+}
+
+// TestTrackTimelineAndOverviewAfterReturn 验证退回待处理后:
+// 追踪时间线来自持久化处置轨迹(含操作人与理由), 概览数字随之一致变化。
+func TestTrackTimelineAndOverviewAfterReturn(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+
+	device := h.createLamp(t, "LD-S-201", "学院路")
+	entity := h.createFault(t, device.ID, "灯不亮")
+
+	_, err := h.repairs.Create(ctx, repair.CreateRequest{FaultID: entity.ID, Repairman: "维修工甲"})
+	require.NoError(t, err)
+
+	before, err := h.status.Overview(ctx)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), before.Fault.ByStatus[fault.StatusProcessing])
+	require.Equal(t, int64(1), before.Repair.OngoingTotal)
+	require.Equal(t, int64(1), before.Lamp.ByRunStatus[lamp.RunStatusMaintenance])
+
+	_, err = h.faults.Return(ctx, entity.ID, fault.ReturnRequest{
+		Operator: "调度员小李", Reason: "类型判断有误, 退回重新研判",
+	})
+	require.NoError(t, err)
+
+	// 时间线来自处置轨迹, 退回节点带操作人与理由
+	track, err := h.status.Track(ctx, status.TrackQuery{FaultNo: entity.FaultNo})
+	require.NoError(t, err)
+	require.Len(t, track.Timeline, 3)
+	require.Equal(t, "reported", track.Timeline[0].Stage)
+	require.Equal(t, "repair_started", track.Timeline[1].Stage)
+	require.Equal(t, "returned", track.Timeline[2].Stage)
+	require.Equal(t, "调度员小李", track.Timeline[2].Operator)
+	require.Equal(t, "类型判断有误, 退回重新研判", track.Timeline[2].Detail)
+
+	// 概览数字随退回一起变化: 待处理回升, 在办维修与维修中路灯回落
+	after, err := h.status.Overview(ctx)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), after.Fault.ByStatus[fault.StatusPending])
+	require.Equal(t, int64(0), after.Fault.ByStatus[fault.StatusProcessing])
+	require.Equal(t, int64(0), after.Repair.OngoingTotal)
+	require.Equal(t, int64(1), after.Lamp.ByRunStatus[lamp.RunStatusFault])
+	require.Equal(t, int64(0), after.Lamp.ByRunStatus[lamp.RunStatusMaintenance])
 }

@@ -6,6 +6,8 @@ import (
 	"strings"
 	"time"
 
+	"gorm.io/gorm"
+
 	"streetlight/internal/apperr"
 	"streetlight/internal/modules/lamp"
 	"streetlight/pkg/pagination"
@@ -31,15 +33,28 @@ type LampPort interface {
 	UpdateRunStatus(ctx context.Context, id uint, status string) error
 }
 
+// RepairPort 由维修模块实现, 故障模块通过它联动在办维修记录(关闭前校验 / 退回时中止)。
+type RepairPort interface {
+	CountOngoingByFault(ctx context.Context, faultID uint) (int64, error)
+	AbortOngoingByFault(ctx context.Context, faultID uint, reason string) (int64, error)
+}
+
 // Service 承载故障登记的业务规则, 并向维修模块提供故障状态流转能力。
 type Service struct {
-	repo  *Repository
-	lamps LampPort
+	repo    *Repository
+	lamps   LampPort
+	repairs RepairPort
 }
 
 // NewService 构造故障登记服务。
 func NewService(repo *Repository, lamps LampPort) *Service {
 	return &Service{repo: repo, lamps: lamps}
+}
+
+// SetRepairPort 注入在办维修联动端口。
+// 在 bootstrap 中装配, 以避免故障模块与维修模块之间的构造顺序耦合。
+func (s *Service) SetRepairPort(port RepairPort) {
+	s.repairs = port
 }
 
 // Repository 暴露仓储, 供 bootstrap 装配其它模块所需的端口。
@@ -131,6 +146,8 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (*Fault, error)
 		return nil, err
 	}
 
+	s.recordTransition(ctx, entity, ActionReported, "", StatusPending, entity.Reporter, entity.Description)
+
 	if err := s.syncLampStatus(ctx, device.ID); err != nil {
 		slog.Warn("同步路灯运行状态失败", "lamp_id", device.ID, "fault_no", entity.FaultNo, "error", err)
 	}
@@ -188,6 +205,7 @@ func (s *Service) Update(ctx context.Context, id uint, req UpdateRequest) (*Faul
 }
 
 // Close 关闭故障, 用于确认闭环或作废处理。
+// 存在在办维修记录时不允许直接关闭, 避免同一盏灯留下悬挂的在办维修。
 func (s *Service) Close(ctx context.Context, id uint, req CloseRequest) (*Fault, error) {
 	entity, err := s.repo.GetByID(ctx, id)
 	if err != nil {
@@ -200,18 +218,93 @@ func (s *Service) Close(ctx context.Context, id uint, req CloseRequest) (*Fault,
 		return nil, apperr.Conflict("故障 %s 当前状态为 %s, 不允许关闭", entity.FaultNo, StatusLabel(entity.Status))
 	}
 
-	now := time.Now()
-	entity.Status = StatusClosed
-	entity.ClosedAt = &now
-	entity.CloseRemark = strings.TrimSpace(req.Remark)
+	if s.repairs != nil {
+		ongoing, err := s.repairs.CountOngoingByFault(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if ongoing > 0 {
+			return nil, apperr.Conflict("故障 %s 存在在办维修记录, 请先完工或退回待处理", entity.FaultNo)
+		}
+	}
 
-	if err := s.repo.Update(ctx, entity); err != nil {
+	now := time.Now()
+	remark := strings.TrimSpace(req.Remark)
+	// 原子流转: 并发的关闭/退回/开工只有一人生效
+	if err := s.repo.TransitStatus(ctx, id, []string{StatusPending, StatusProcessing, StatusRepaired}, map[string]any{
+		"status":       StatusClosed,
+		"closed_at":    &now,
+		"close_remark": remark,
+	}); err != nil {
 		return nil, err
 	}
+
+	s.recordTransition(ctx, entity, ActionClosed, entity.Status, StatusClosed, req.Operator, remark)
+
 	if err := s.syncLampStatus(ctx, entity.LampID); err != nil {
 		slog.Warn("同步路灯运行状态失败", "lamp_id", entity.LampID, "fault_no", entity.FaultNo, "error", err)
 	}
+
+	entity.Status = StatusClosed
+	entity.ClosedAt = &now
+	entity.CloseRemark = remark
 	return entity, nil
+}
+
+// Return 退回待处理: 维修过程中发现判断有误时, 将故障退回待处理队列重新研判。
+// 在办维修记录同步中止为已退回, 路灯运行状态随之回落; 已关闭的故障不再参与退回。
+// 状态流转为原子条件更新, 两人同时退回只有一人生效。
+func (s *Service) Return(ctx context.Context, id uint, req ReturnRequest) (*Fault, error) {
+	entity, err := s.repo.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if entity.Status == StatusClosed {
+		return nil, apperr.Conflict("故障 %s 已关闭, 不再参与退回", entity.FaultNo)
+	}
+	if entity.Status == StatusPending {
+		return nil, apperr.Conflict("故障 %s 已是待处理状态, 无需退回", entity.FaultNo)
+	}
+
+	operator := strings.TrimSpace(req.Operator)
+	if operator == "" {
+		return nil, apperr.BadRequest("操作人不能为空")
+	}
+	reason := strings.TrimSpace(req.Reason)
+	if reason == "" {
+		return nil, apperr.BadRequest("退回原因不能为空")
+	}
+
+	fromStatus := entity.Status
+	if err := s.repo.TransitStatus(ctx, id, []string{StatusProcessing, StatusRepaired}, map[string]any{
+		"status": StatusPending,
+	}); err != nil {
+		return nil, err
+	}
+
+	// 中止在办维修记录, 释放该路灯的维修槽位, 保证退回与重新开工之间不会挂着两条在办维修
+	if s.repairs != nil {
+		if _, err := s.repairs.AbortOngoingByFault(ctx, id, reason); err != nil {
+			slog.Warn("中止在办维修记录失败", "fault_no", entity.FaultNo, "error", err)
+		}
+	}
+
+	s.recordTransition(ctx, entity, ActionReturned, fromStatus, StatusPending, operator, reason)
+
+	if err := s.syncLampStatus(ctx, entity.LampID); err != nil {
+		slog.Warn("同步路灯运行状态失败", "lamp_id", entity.LampID, "fault_no", entity.FaultNo, "error", err)
+	}
+
+	entity.Status = StatusPending
+	return entity, nil
+}
+
+// ListTransitions 查询故障的处置轨迹, 按时间正序返回每次流转的操作人与理由。
+func (s *Service) ListTransitions(ctx context.Context, faultID uint) ([]FaultTransition, error) {
+	if _, err := s.repo.GetByID(ctx, faultID); err != nil {
+		return nil, err
+	}
+	return s.repo.ListTransitions(ctx, faultID)
 }
 
 // Delete 删除故障, 仅允许删除已关闭且没有维修记录的故障。
@@ -245,8 +338,9 @@ func (s *Service) Metadata() *Meta {
 	}
 }
 
-// OnRepairStarted 维修开工: 故障进入维修中, 维修次数累加, 并同步路灯状态。
-func (s *Service) OnRepairStarted(ctx context.Context, faultID uint, repairID uint) error {
+// OnRepairStarted 维修开工: 故障进入维修中, 维修次数累加, 记录轨迹并同步路灯状态。
+// 状态流转为原子条件更新, 与退回/关闭并发时只有一个操作生效。
+func (s *Service) OnRepairStarted(ctx context.Context, faultID uint, repairID uint, operator string) error {
 	entity, err := s.repo.GetByID(ctx, faultID)
 	if err != nil {
 		return err
@@ -255,31 +349,44 @@ func (s *Service) OnRepairStarted(ctx context.Context, faultID uint, repairID ui
 		return apperr.Conflict("故障 %s 当前状态为 %s, 不允许开工维修", entity.FaultNo, StatusLabel(entity.Status))
 	}
 
-	entity.Status = StatusProcessing
-	entity.RepairCount++
-	entity.LatestRepairID = &repairID
-
-	if err := s.repo.Update(ctx, entity); err != nil {
+	if err := s.repo.TransitStatus(ctx, faultID, []string{StatusPending, StatusProcessing, StatusRepaired}, map[string]any{
+		"status":           StatusProcessing,
+		"repair_count":     gorm.Expr("repair_count + 1"),
+		"latest_repair_id": repairID,
+	}); err != nil {
 		return err
 	}
+
+	s.recordTransition(ctx, entity, ActionRepairStarted, entity.Status, StatusProcessing, operator, "")
 	return s.syncLampStatus(ctx, entity.LampID)
 }
 
-// OnRepairFinished 维修完成: 结果为已修复时故障转为已修复, 否则保持维修中。
-func (s *Service) OnRepairFinished(ctx context.Context, faultID uint, fixed bool) error {
+// OnRepairFinished 维修完成: 结果为已修复时故障转为已修复, 否则保持维修中, 并记录轨迹。
+// 故障已被并发关闭时, 维修完工仍然有效, 仅跳过状态流转。
+func (s *Service) OnRepairFinished(ctx context.Context, faultID uint, fixed bool, operator string, resultLabel string) error {
 	entity, err := s.repo.GetByID(ctx, faultID)
 	if err != nil {
 		return err
 	}
+
+	toStatus := entity.Status
 	if fixed {
-		if !canTransitTo(entity.Status, StatusRepaired) {
-			return apperr.Conflict("故障 %s 当前状态为 %s, 无法标记为已修复", entity.FaultNo, StatusLabel(entity.Status))
-		}
-		entity.Status = StatusRepaired
-		if err := s.repo.Update(ctx, entity); err != nil {
-			return err
+		if entity.Status == StatusClosed {
+			slog.Warn("故障已关闭, 跳过已修复流转", "fault_no", entity.FaultNo)
+		} else {
+			if !canTransitTo(entity.Status, StatusRepaired) {
+				return apperr.Conflict("故障 %s 当前状态为 %s, 无法标记为已修复", entity.FaultNo, StatusLabel(entity.Status))
+			}
+			if err := s.repo.TransitStatus(ctx, faultID, []string{StatusProcessing}, map[string]any{
+				"status": StatusRepaired,
+			}); err != nil {
+				return err
+			}
+			toStatus = StatusRepaired
 		}
 	}
+
+	s.recordTransition(ctx, entity, ActionRepairFinished, entity.Status, toStatus, operator, resultLabel)
 	return s.syncLampStatus(ctx, entity.LampID)
 }
 
@@ -302,6 +409,52 @@ func (s *Service) SyncRepairStats(ctx context.Context, faultID uint, repairCount
 		return err
 	}
 	return s.syncLampStatus(ctx, entity.LampID)
+}
+
+// recordTransition 写入一条处置轨迹, 记录每次流转的操作人与理由; 写失败仅记录日志, 不影响主流程。
+// 历史数据(直接落库、未经服务层)没有轨迹记录, 首次流转时先补一条登记节点, 保证轨迹从上报开始完整。
+func (s *Service) recordTransition(ctx context.Context, entity *Fault, action, fromStatus, toStatus, operator, reason string) {
+	if action != ActionReported {
+		s.backfillReportedTransition(ctx, entity)
+	}
+	transition := &FaultTransition{
+		FaultID:    entity.ID,
+		FaultNo:    entity.FaultNo,
+		LampID:     entity.LampID,
+		Action:     action,
+		FromStatus: fromStatus,
+		ToStatus:   toStatus,
+		Operator:   strings.TrimSpace(operator),
+		Reason:     strings.TrimSpace(reason),
+	}
+	if err := s.repo.CreateTransition(ctx, transition); err != nil {
+		slog.Warn("记录故障处置轨迹失败", "fault_no", entity.FaultNo, "action", action, "error", err)
+	}
+}
+
+// backfillReportedTransition 为没有任何轨迹的历史故障补录"故障登记"节点, 时间取上报时间。
+func (s *Service) backfillReportedTransition(ctx context.Context, entity *Fault) {
+	count, err := s.repo.CountTransitions(ctx, entity.ID)
+	if err != nil {
+		slog.Warn("查询故障处置轨迹失败", "fault_no", entity.FaultNo, "error", err)
+		return
+	}
+	if count > 0 {
+		return
+	}
+	backfill := &FaultTransition{
+		FaultID:   entity.ID,
+		FaultNo:   entity.FaultNo,
+		LampID:    entity.LampID,
+		Action:    ActionReported,
+		ToStatus:  StatusPending,
+		Operator:  entity.Reporter,
+		Reason:    entity.Description,
+		CreatedAt: entity.ReportedAt,
+	}
+	if err := s.repo.CreateTransition(ctx, backfill); err != nil {
+		slog.Warn("补录故障登记轨迹失败", "fault_no", entity.FaultNo, "error", err)
+	}
 }
 
 // syncLampStatus 依据该路灯的故障分布重新计算并写回运行状态。

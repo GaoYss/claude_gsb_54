@@ -316,9 +316,13 @@ func (s *Service) Track(ctx context.Context, query TrackQuery) (*TrackResult, er
 			if err != nil {
 				return nil, err
 			}
+			timeline, err := s.resolveTimeline(ctx, &latest, repairs)
+			if err != nil {
+				return nil, err
+			}
 			result.Fault = &latest
 			result.Repairs = repairs
-			result.Timeline = buildTimeline(&latest, repairs)
+			result.Timeline = timeline
 		}
 		return result, nil
 
@@ -337,13 +341,45 @@ func (s *Service) buildFaultTrack(ctx context.Context, entity *fault.Fault) (*Tr
 	if err != nil {
 		return nil, err
 	}
+	timeline, err := s.resolveTimeline(ctx, entity, repairs)
+	if err != nil {
+		return nil, err
+	}
 	return &TrackResult{
 		SearchType: "fault",
 		Lamp:       device,
 		Fault:      entity,
 		Repairs:    repairs,
-		Timeline:   buildTimeline(entity, repairs),
+		Timeline:   timeline,
 	}, nil
+}
+
+// resolveTimeline 优先使用持久化的处置轨迹(含每次流转的操作人与理由);
+// 历史数据没有轨迹记录时, 回退到按故障与维修记录派生的时间线。
+func (s *Service) resolveTimeline(ctx context.Context, entity *fault.Fault, repairs []repair.Repair) ([]TimelineEvent, error) {
+	transitions, err := s.faults.ListTransitions(ctx, entity.ID)
+	if err != nil {
+		return nil, err
+	}
+	if len(transitions) > 0 {
+		return transitionsToTimeline(transitions), nil
+	}
+	return buildTimeline(entity, repairs), nil
+}
+
+// transitionsToTimeline 将持久化的处置轨迹转换为时间线事件。
+func transitionsToTimeline(transitions []fault.FaultTransition) []TimelineEvent {
+	events := make([]TimelineEvent, 0, len(transitions))
+	for _, item := range transitions {
+		events = append(events, TimelineEvent{
+			Stage:     item.Action,
+			Label:     fault.ActionLabel(item.Action),
+			Operator:  item.Operator,
+			Detail:    item.Reason,
+			Timestamp: item.CreatedAt,
+		})
+	}
+	return events
 }
 
 // countFaultsByLamp 批量统计每盏路灯的故障数量, openOnly 为 true 时仅统计未闭环故障。

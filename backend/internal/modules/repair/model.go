@@ -6,6 +6,7 @@ import "time"
 const (
 	StatusOngoing  = "ongoing"  // 维修中
 	StatusFinished = "finished" // 已完成
+	StatusReturned = "returned" // 已退回(故障退回待处理时被中止)
 )
 
 // 维修结果。
@@ -18,7 +19,7 @@ const (
 
 // Statuses 返回全部维修记录状态。
 func Statuses() []string {
-	return []string{StatusOngoing, StatusFinished}
+	return []string{StatusOngoing, StatusFinished, StatusReturned}
 }
 
 // Results 返回全部维修结果取值。
@@ -55,6 +56,7 @@ type Repair struct {
 	Materials    string     `gorm:"size:255" json:"materials"`
 	Cost         float64    `json:"cost"`
 	Remark       string     `gorm:"size:255" json:"remark"`
+	ReturnReason string     `gorm:"size:255" json:"return_reason"`
 
 	// DurationMinutes 仅用于响应展示的维修耗时(分钟), 不落库。
 	DurationMinutes *int64 `gorm:"-" json:"duration_minutes,omitempty"`

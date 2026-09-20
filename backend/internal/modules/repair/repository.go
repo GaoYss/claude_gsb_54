@@ -49,7 +49,8 @@ func (r *Repository) Create(ctx context.Context, entity *Repair) error {
 	return nil
 }
 
-// CreateWithUniqueNo 生成唯一维修单号并落库, 冲突时自动重试。
+// CreateWithUniqueNo 生成唯一维修单号并落库, 单号冲突时自动重试。
+// 若违反"同一盏灯同时最多一条在办维修"的唯一约束(idx_repair_lamp_ongoing), 直接返回 409 冲突。
 func (r *Repository) CreateWithUniqueNo(ctx context.Context, entity *Repair, prefix string) error {
 	for attempt := 0; attempt < 5; attempt++ {
 		sequence, err := r.NextSequence(ctx, prefix)
@@ -63,6 +64,13 @@ func (r *Repository) CreateWithUniqueNo(ctx context.Context, entity *Repair, pre
 		}
 		if !isUniqueViolation(err) {
 			return err
+		}
+		// 唯一冲突可能来自维修单号, 也可能来自"一灯一条在办"约束; 后者不重试, 直接报冲突。
+		if entity.Status == StatusOngoing {
+			ongoing, queryErr := r.GetOngoingByLamp(ctx, entity.LampID)
+			if queryErr == nil && ongoing != nil {
+				return apperr.Conflict("路灯 %s 已有在办维修记录 %s, 同一盏灯不允许同时存在两条在办维修", entity.LampCode, ongoing.RepairNo)
+			}
 		}
 	}
 	return apperr.Conflict("维修单号生成冲突, 请稍后重试")
@@ -167,6 +175,70 @@ func (r *Repository) GetOngoingByFault(ctx context.Context, faultID uint) (*Repa
 		return nil, fmt.Errorf("查询进行中的维修记录失败: %w", err)
 	}
 	return &entity, nil
+}
+
+// GetOngoingByLamp 查询某盏路灯当前在办的维修记录, 不存在时返回 nil。
+// 同一盏灯同时只允许一条在办维修, 由唯一索引 idx_repair_lamp_ongoing 兜底保证。
+func (r *Repository) GetOngoingByLamp(ctx context.Context, lampID uint) (*Repair, error) {
+	var entity Repair
+	err := r.session(ctx).
+		Where("lamp_id = ? AND status = ?", lampID, StatusOngoing).
+		Order("started_at DESC, id DESC").
+		First(&entity).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("查询路灯在办维修记录失败: %w", err)
+	}
+	return &entity, nil
+}
+
+// CountOngoingByFault 统计某条故障当前在办的维修记录数量。
+func (r *Repository) CountOngoingByFault(ctx context.Context, faultID uint) (int64, error) {
+	var count int64
+	err := r.session(ctx).Model(&Repair{}).
+		Where("fault_id = ? AND status = ?", faultID, StatusOngoing).
+		Count(&count).Error
+	if err != nil {
+		return 0, fmt.Errorf("统计在办维修记录失败: %w", err)
+	}
+	return count, nil
+}
+
+// MarkOngoingReturned 将故障的在办维修记录中止为已退回并记录退回原因, 返回中止的记录数。
+// 条件更新保证与并发完工互斥, 只有一个操作生效。
+func (r *Repository) MarkOngoingReturned(ctx context.Context, faultID uint, reason string) (int64, error) {
+	result := r.session(ctx).Model(&Repair{}).
+		Where("fault_id = ? AND status = ?", faultID, StatusOngoing).
+		Updates(map[string]any{"status": StatusReturned, "return_reason": reason})
+	if result.Error != nil {
+		return 0, fmt.Errorf("中止在办维修记录失败: %w", result.Error)
+	}
+	return result.RowsAffected, nil
+}
+
+// FinishOngoing 原子完工: 仅当记录仍处于在办状态时更新生效,
+// 并发完工/退回只有一个调用成功, 其余返回 409 冲突。
+func (r *Repository) FinishOngoing(ctx context.Context, id uint, columns map[string]any) error {
+	result := r.session(ctx).Model(&Repair{}).
+		Where("id = ? AND status = ?", id, StatusOngoing).
+		Updates(columns)
+	if result.Error != nil {
+		return fmt.Errorf("更新维修记录失败: %w", result.Error)
+	}
+	if result.RowsAffected == 0 {
+		var current Repair
+		err := r.session(ctx).First(&current, id).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return apperr.NotFound("维修记录不存在: id=%d", id)
+		}
+		if err != nil {
+			return fmt.Errorf("查询维修记录失败: %w", err)
+		}
+		return apperr.Conflict("维修记录 %s 当前状态为 %s, 操作未生效, 请刷新后重试", current.RepairNo, StatusLabel(current.Status))
+	}
+	return nil
 }
 
 // LatestByFault 查询某条故障最近一次维修记录, 不存在时返回 nil。
@@ -282,7 +354,7 @@ func (r *Repository) AverageDurationHours(ctx context.Context) (float64, error) 
 func (r *Repository) DistinctValues(ctx context.Context, column string) ([]string, error) {
 	values := make([]string, 0)
 	err := r.session(ctx).Model(&Repair{}).
-		Where(column + " <> ''").
+		Where(column+" <> ''").
 		Distinct().
 		Order(column).
 		Pluck(column, &values).Error

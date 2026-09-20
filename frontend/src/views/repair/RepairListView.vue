@@ -60,11 +60,12 @@
           <template #default="{ row }">{{ formatMoney(row.cost) }}</template>
         </el-table-column>
         <el-table-column prop="content" label="维修内容" min-width="180" show-overflow-tooltip />
-        <el-table-column label="操作" width="240" fixed="right">
+        <el-table-column label="操作" width="300" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" @click="openDetail(row)">故障详情</el-button>
             <el-button v-if="row.status === 'ongoing'" link type="success" @click="openFinish(row)">完成维修</el-button>
             <el-button v-if="row.status === 'ongoing'" link type="primary" @click="openEdit(row)">编辑</el-button>
+            <el-button v-if="row.status === 'ongoing'" link type="danger" @click="openReturn(row)">退回</el-button>
             <el-button link type="danger" @click="handleDelete(row)">删除</el-button>
           </template>
         </el-table-column>
@@ -81,6 +82,7 @@
     <RepairFormDialog v-model="formVisible" :model="editing" @saved="handleSaved" />
     <FinishRepairDialog v-model="finishVisible" :model="finishing" @saved="handleSaved" />
     <FaultDetailDrawer v-model="detailVisible" :fault-id="activeFaultId" />
+    <ReturnFaultDialog v-model="returnVisible" :fault="returnTarget" @saved="handleSaved" />
   </div>
 </template>
 
@@ -95,6 +97,7 @@ import DataPagination from '@/components/common/DataPagination.vue'
 import RepairFormDialog from './components/RepairFormDialog.vue'
 import FinishRepairDialog from './components/FinishRepairDialog.vue'
 import FaultDetailDrawer from '@/views/fault/components/FaultDetailDrawer.vue'
+import ReturnFaultDialog from '@/views/fault/components/ReturnFaultDialog.vue'
 import { repairApi } from '@/api/repair'
 import { useDictStore } from '@/stores/dict'
 import { REPAIR_RESULT, REPAIR_STATUS } from '@/constants/dict'
@@ -118,8 +121,10 @@ const dateRange = ref([])
 const formVisible = ref(false)
 const finishVisible = ref(false)
 const detailVisible = ref(false)
+const returnVisible = ref(false)
 const editing = ref(null)
 const finishing = ref(null)
+const returnTarget = ref(null)
 const activeFaultId = ref(null)
 
 function applyDateRange() {
@@ -155,6 +160,17 @@ function openFinish(row) {
 function openDetail(row) {
   activeFaultId.value = row.fault_id
   detailVisible.value = true
+}
+
+// 维修过程中发现判断有误时, 可将关联故障退回待处理重新研判
+function openReturn(row) {
+  returnTarget.value = {
+    id: row.fault_id,
+    fault_no: row.fault_no,
+    lamp_code: row.lamp_code,
+    status: 'processing',
+  }
+  returnVisible.value = true
 }
 
 async function handleDelete(row) {

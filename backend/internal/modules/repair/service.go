@@ -28,8 +28,8 @@ var repairSortSpec = pagination.SortSpec{
 // FaultPort 由故障登记模块实现, 维修模块通过它联动故障状态与路灯状态。
 type FaultPort interface {
 	GetByID(ctx context.Context, id uint) (*fault.Fault, error)
-	OnRepairStarted(ctx context.Context, faultID uint, repairID uint) error
-	OnRepairFinished(ctx context.Context, faultID uint, fixed bool) error
+	OnRepairStarted(ctx context.Context, faultID uint, repairID uint, operator string) error
+	OnRepairFinished(ctx context.Context, faultID uint, fixed bool, operator string, resultLabel string) error
 	SyncRepairStats(ctx context.Context, faultID uint, repairCount int, latestRepairID *uint) error
 }
 
@@ -72,6 +72,8 @@ func (s *Service) ListByFault(ctx context.Context, faultID uint) ([]Repair, erro
 }
 
 // Create 录入维修记录(维修开工), 并联动故障与路灯状态。
+// 同一盏灯同时只允许一条在办维修: 服务层先做灯级校验给出明确提示,
+// 数据库唯一索引 idx_repair_lamp_ongoing 兜底, 两人同时开工只有一人生效。
 func (s *Service) Create(ctx context.Context, req CreateRequest) (*Repair, error) {
 	target, err := s.faults.GetByID(ctx, req.FaultID)
 	if err != nil {
@@ -81,15 +83,15 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (*Repair, error
 		return nil, apperr.Conflict("故障 %s 已关闭, 不允许再登记维修记录", target.FaultNo)
 	}
 	if target.Status == fault.StatusRepaired {
-		return nil, apperr.Conflict("故障 %s 已修复, 如需返修请先登记新的维修记录并重新开工", target.FaultNo)
+		return nil, apperr.Conflict("故障 %s 已修复, 如需返修请先退回待处理再重新开工", target.FaultNo)
 	}
 
-	ongoing, err := s.repo.GetOngoingByFault(ctx, target.ID)
+	ongoing, err := s.repo.GetOngoingByLamp(ctx, target.LampID)
 	if err != nil {
 		return nil, err
 	}
 	if ongoing != nil {
-		return nil, apperr.Conflict("故障 %s 已有进行中的维修记录 %s, 请先完成后再录入", target.FaultNo, ongoing.RepairNo)
+		return nil, apperr.Conflict("路灯 %s 已有在办维修记录 %s, 请先完工或退回后再开工", target.LampCode, ongoing.RepairNo)
 	}
 
 	repairman := strings.TrimSpace(req.Repairman)
@@ -125,8 +127,12 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (*Repair, error
 		return nil, err
 	}
 
-	// 开工后: 故障转为维修中, 路灯转为维修状态
-	if err := s.faults.OnRepairStarted(ctx, target.ID, entity.ID); err != nil {
+	// 开工后: 故障转为维修中, 路灯转为维修状态。
+	// 联动失败(如故障被并发关闭)时补偿删除刚录入的记录, 避免留下悬挂的在办维修。
+	if err := s.faults.OnRepairStarted(ctx, target.ID, entity.ID, repairman); err != nil {
+		if delErr := s.repo.Delete(ctx, entity.ID); delErr != nil {
+			slog.Warn("开工联动失败后补偿删除维修记录失败", "repair_no", entity.RepairNo, "error", delErr)
+		}
 		return nil, err
 	}
 
@@ -185,6 +191,7 @@ func (s *Service) Update(ctx context.Context, id uint, req UpdateRequest) (*Repa
 }
 
 // Finish 完成维修: 记录结果与完工时间, 结果为已修复时联动故障转为已修复。
+// 完工为原子条件更新, 与退回/重复完工并发时只有一个操作生效。
 func (s *Service) Finish(ctx context.Context, id uint, req FinishRequest) (*Repair, error) {
 	entity, err := s.repo.GetByID(ctx, id)
 	if err != nil {
@@ -192,6 +199,9 @@ func (s *Service) Finish(ctx context.Context, id uint, req FinishRequest) (*Repa
 	}
 	if entity.Status == StatusFinished {
 		return nil, apperr.Conflict("维修记录 %s 已完成, 不允许重复提交", entity.RepairNo)
+	}
+	if entity.Status == StatusReturned {
+		return nil, apperr.Conflict("维修记录 %s 已随故障退回而中止, 不允许完工", entity.RepairNo)
 	}
 
 	result := strings.TrimSpace(req.Result)
@@ -207,32 +217,37 @@ func (s *Service) Finish(ctx context.Context, id uint, req FinishRequest) (*Repa
 		return nil, apperr.BadRequest("完工时间不能早于开工时间")
 	}
 
-	entity.FinishedAt = &finishedAt
-	entity.Status = StatusFinished
-	entity.Result = result
+	columns := map[string]any{
+		"finished_at": &finishedAt,
+		"status":      StatusFinished,
+		"result":      result,
+	}
 	if content := strings.TrimSpace(req.Content); content != "" {
-		entity.Content = content
+		columns["content"] = content
 	}
 	if materials := strings.TrimSpace(req.Materials); materials != "" {
-		entity.Materials = materials
+		columns["materials"] = materials
 	}
 	if req.Cost != nil {
-		entity.Cost = *req.Cost
+		columns["cost"] = *req.Cost
 	}
 	if remark := strings.TrimSpace(req.Remark); remark != "" {
-		entity.Remark = remark
+		columns["remark"] = remark
 	}
 
-	if err := s.repo.Update(ctx, entity); err != nil {
+	if err := s.repo.FinishOngoing(ctx, id, columns); err != nil {
 		return nil, err
 	}
 
-	if err := s.faults.OnRepairFinished(ctx, entity.FaultID, result == ResultFixed); err != nil {
+	if err := s.faults.OnRepairFinished(ctx, entity.FaultID, result == ResultFixed, entity.Repairman, ResultLabel(result)); err != nil {
 		return nil, err
 	}
 
-	entity.FillDuration()
-	return entity, nil
+	finished, err := s.repo.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return finished, nil
 }
 
 // Delete 删除维修记录, 已关闭故障的维修记录不允许删除。
@@ -270,6 +285,16 @@ func (s *Service) Delete(ctx context.Context, id uint) error {
 		slog.Warn("同步故障维修统计失败", "fault_id", entity.FaultID, "error", err)
 	}
 	return nil
+}
+
+// CountOngoingByFault 统计故障的在办维修数量, 实现故障模块 RepairPort(关闭前校验)。
+func (s *Service) CountOngoingByFault(ctx context.Context, faultID uint) (int64, error) {
+	return s.repo.CountOngoingByFault(ctx, faultID)
+}
+
+// AbortOngoingByFault 将故障的在办维修记录中止为已退回, 实现故障模块 RepairPort(退回时联动)。
+func (s *Service) AbortOngoingByFault(ctx context.Context, faultID uint, reason string) (int64, error) {
+	return s.repo.MarkOngoingReturned(ctx, faultID, reason)
 }
 
 // Metadata 返回维修模块字典。

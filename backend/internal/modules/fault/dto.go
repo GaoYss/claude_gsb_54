@@ -27,7 +27,14 @@ type UpdateRequest struct {
 
 // CloseRequest 关闭故障请求, 用于作废或确认闭环。
 type CloseRequest struct {
-	Remark string `json:"remark" binding:"max=255"`
+	Operator string `json:"operator" binding:"omitempty,max=64"`
+	Remark   string `json:"remark" binding:"max=255"`
+}
+
+// ReturnRequest 退回待处理请求, 必须填写操作人与退回原因, 两者都会写入处置轨迹。
+type ReturnRequest struct {
+	Operator string `json:"operator" binding:"required,max=64"`
+	Reason   string `json:"reason" binding:"required,max=255"`
 }
 
 // ListQuery 故障列表查询条件。

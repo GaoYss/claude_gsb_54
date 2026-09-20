@@ -113,6 +113,57 @@ func (r *Repository) UpdateColumns(ctx context.Context, id uint, columns map[str
 	return nil
 }
 
+// TransitStatus 原子流转故障状态: 仅当当前状态属于 from 集合时更新生效,
+// 并发操作(退回/关闭/开工)只有一个调用成功, 其余返回 409 冲突。
+func (r *Repository) TransitStatus(ctx context.Context, id uint, from []string, columns map[string]any) error {
+	result := r.session(ctx).Model(&Fault{}).
+		Where("id = ? AND status IN ?", id, from).
+		Updates(columns)
+	if result.Error != nil {
+		return fmt.Errorf("流转故障状态失败: %w", result.Error)
+	}
+	if result.RowsAffected == 0 {
+		var current Fault
+		err := r.session(ctx).First(&current, id).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return apperr.NotFound("故障记录不存在: id=%d", id)
+		}
+		if err != nil {
+			return fmt.Errorf("查询故障失败: %w", err)
+		}
+		return apperr.Conflict("故障 %s 当前状态为 %s, 操作未生效, 请刷新后重试", current.FaultNo, StatusLabel(current.Status))
+	}
+	return nil
+}
+
+// CreateTransition 写入一条故障处置轨迹。
+func (r *Repository) CreateTransition(ctx context.Context, transition *FaultTransition) error {
+	if err := r.session(ctx).Create(transition).Error; err != nil {
+		return fmt.Errorf("记录故障处置轨迹失败: %w", err)
+	}
+	return nil
+}
+
+// ListTransitions 查询故障的处置轨迹, 按时间正序。
+func (r *Repository) ListTransitions(ctx context.Context, faultID uint) ([]FaultTransition, error) {
+	entities := make([]FaultTransition, 0)
+	err := r.session(ctx).Where("fault_id = ?", faultID).Order("created_at ASC, id ASC").Find(&entities).Error
+	if err != nil {
+		return nil, fmt.Errorf("查询故障处置轨迹失败: %w", err)
+	}
+	return entities, nil
+}
+
+// CountTransitions 统计故障的处置轨迹数量, 用于判断是否需要补录登记节点。
+func (r *Repository) CountTransitions(ctx context.Context, faultID uint) (int64, error) {
+	var count int64
+	err := r.session(ctx).Model(&FaultTransition{}).Where("fault_id = ?", faultID).Count(&count).Error
+	if err != nil {
+		return 0, fmt.Errorf("统计故障处置轨迹失败: %w", err)
+	}
+	return count, nil
+}
+
 // Delete 按主键删除故障。
 func (r *Repository) Delete(ctx context.Context, id uint) error {
 	if err := r.session(ctx).Delete(&Fault{}, id).Error; err != nil {

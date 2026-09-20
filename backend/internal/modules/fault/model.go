@@ -59,13 +59,23 @@ func IsValidStatus(status string) bool {
 	return false
 }
 
+// 故障处置动作, 用于处置轨迹记录, 取值与前端时间线字典一致。
+const (
+	ActionReported       = "reported"        // 故障登记
+	ActionRepairStarted  = "repair_started"  // 维修开工
+	ActionRepairFinished = "repair_finished" // 维修完成
+	ActionReturned       = "returned"        // 退回待处理
+	ActionClosed         = "closed"          // 故障关闭
+)
+
 // IsOpen 判断故障是否仍处于未闭环状态。
 func IsOpen(status string) bool {
 	return status == StatusPending || status == StatusProcessing
 }
 
 // canTransitTo 校验状态流转是否合法。
-// 待处理 -> 维修中 / 已关闭, 维修中 -> 已修复 / 已关闭, 已修复 -> 已关闭 / 返修(维修中)。
+// 待处理 -> 维修中 / 已关闭, 维修中 -> 已修复 / 已关闭 / 退回待处理,
+// 已修复 -> 已关闭 / 返修(维修中) / 退回待处理, 已关闭不再参与任何流转。
 func canTransitTo(from, to string) bool {
 	if from == to {
 		return true
@@ -74,9 +84,9 @@ func canTransitTo(from, to string) bool {
 	case StatusPending:
 		return to == StatusProcessing || to == StatusClosed
 	case StatusProcessing:
-		return to == StatusRepaired || to == StatusClosed
+		return to == StatusRepaired || to == StatusClosed || to == StatusPending
 	case StatusRepaired:
-		return to == StatusClosed || to == StatusProcessing
+		return to == StatusClosed || to == StatusProcessing || to == StatusPending
 	default:
 		return false
 	}
@@ -107,3 +117,20 @@ type Fault struct {
 
 // TableName 指定表名。
 func (Fault) TableName() string { return "fault" }
+
+// FaultTransition 故障处置轨迹, 按时间保留每次状态流转的操作人与理由。
+type FaultTransition struct {
+	ID         uint      `gorm:"primaryKey" json:"id"`
+	FaultID    uint      `gorm:"index;not null" json:"fault_id"`
+	FaultNo    string    `gorm:"size:64;index" json:"fault_no"`
+	LampID     uint      `gorm:"index" json:"lamp_id"`
+	Action     string    `gorm:"size:32;index;not null" json:"action"`
+	FromStatus string    `gorm:"size:32" json:"from_status"`
+	ToStatus   string    `gorm:"size:32" json:"to_status"`
+	Operator   string    `gorm:"size:64" json:"operator"`
+	Reason     string    `gorm:"size:255" json:"reason"`
+	CreatedAt  time.Time `gorm:"index;not null" json:"created_at"`
+}
+
+// TableName 指定表名。
+func (FaultTransition) TableName() string { return "fault_transition" }

@@ -55,8 +55,8 @@ type RepairSummary struct {
 
 // Overview 维修状态总览看板。
 type Overview struct {
-	Lamp          LampSummary  `json:"lamp"`
-	Fault         FaultSummary `json:"fault"`
+	Lamp          LampSummary   `json:"lamp"`
+	Fault         FaultSummary  `json:"fault"`
 	Repair        RepairSummary `json:"repair"`
 	FaultByType   []LabelCount  `json:"fault_by_type"`
 	FaultByLevel  []LabelCount  `json:"fault_by_level"`
@@ -101,10 +101,10 @@ type TimelineEvent struct {
 
 // TrackResult 是单条故障(或单盏路灯)的完整处理链路。
 type TrackResult struct {
-	SearchType    string            `json:"search_type"`
-	Lamp          *lamp.Lamp        `json:"lamp,omitempty"`
-	Fault         *fault.Fault      `json:"fault,omitempty"`
-	Repairs       []repair.Repair   `json:"repairs"`
-	Timeline      []TimelineEvent   `json:"timeline"`
-	RelatedFaults []FaultBrief      `json:"related_faults,omitempty"`
+	SearchType    string          `json:"search_type"`
+	Lamp          *lamp.Lamp      `json:"lamp,omitempty"`
+	Fault         *fault.Fault    `json:"fault,omitempty"`
+	Repairs       []repair.Repair `json:"repairs"`
+	Timeline      []TimelineEvent `json:"timeline"`
+	RelatedFaults []FaultBrief    `json:"related_faults,omitempty"`
 }

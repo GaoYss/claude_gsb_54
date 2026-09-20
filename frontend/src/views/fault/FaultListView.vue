@@ -54,12 +54,13 @@
         <el-table-column label="维修次数" width="90" align="center">
           <template #default="{ row }">{{ row.repair_count }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="260" fixed="right">
+        <el-table-column label="操作" width="330" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" @click="openDetail(row)">详情</el-button>
             <el-button v-if="isOpen(row)" link type="warning" @click="openRepair(row)">维修录入</el-button>
+            <el-button v-if="canReturn(row)" link type="danger" @click="openReturn(row)">退回</el-button>
             <el-button v-if="row.status !== 'closed'" link type="primary" @click="openEdit(row)">编辑</el-button>
-            <el-button v-if="row.status !== 'closed'" link type="info" @click="handleClose(row)">关闭</el-button>
+            <el-button v-if="row.status !== 'closed'" link type="info" @click="openClose(row)">关闭</el-button>
             <el-button v-if="row.status === 'closed'" link type="danger" @click="handleDelete(row)">删除</el-button>
           </template>
         </el-table-column>
@@ -82,6 +83,8 @@
     />
     <FaultDetailDrawer v-model="detailVisible" :fault-id="activeFaultId" />
     <RepairFormDialog v-model="repairVisible" :fault="repairTarget" @saved="handleSaved" />
+    <ReturnFaultDialog v-model="returnVisible" :fault="returnTarget" @saved="handleSaved" />
+    <CloseFaultDialog v-model="closeVisible" :fault="closeTarget" @saved="handleSaved" />
   </div>
 </template>
 
@@ -95,6 +98,8 @@ import StatusTag from '@/components/common/StatusTag.vue'
 import DataPagination from '@/components/common/DataPagination.vue'
 import FaultFormDialog from './components/FaultFormDialog.vue'
 import FaultDetailDrawer from './components/FaultDetailDrawer.vue'
+import ReturnFaultDialog from './components/ReturnFaultDialog.vue'
+import CloseFaultDialog from './components/CloseFaultDialog.vue'
 import RepairFormDialog from '@/views/repair/components/RepairFormDialog.vue'
 import { faultApi } from '@/api/fault'
 import { lampApi } from '@/api/lamp'
@@ -123,12 +128,18 @@ const dateRange = ref([])
 const formVisible = ref(false)
 const detailVisible = ref(false)
 const repairVisible = ref(false)
+const returnVisible = ref(false)
+const closeVisible = ref(false)
 const editing = ref(null)
 const presetLamp = ref(null)
 const repairTarget = ref(null)
+const returnTarget = ref(null)
+const closeTarget = ref(null)
 const activeFaultId = ref(null)
 
 const isOpen = (row) => row.status === 'pending' || row.status === 'processing'
+// 维修中 / 已修复的故障允许退回待处理, 已关闭不再参与退回
+const canReturn = (row) => row.status === 'processing' || row.status === 'repaired'
 
 // 日期区间变化时同步到查询条件。
 function applyDateRange() {
@@ -166,19 +177,14 @@ function openRepair(row) {
   repairVisible.value = true
 }
 
-async function handleClose(row) {
-  try {
-    const { value } = await ElMessageBox.prompt('请输入关闭说明 (例如: 现场复核通过 / 误报作废)', `关闭故障 ${row.fault_no}`, {
-      confirmButtonText: '确认关闭',
-      cancelButtonText: '取消',
-      inputPlaceholder: '关闭说明',
-    })
-    await faultApi.close(row.id, { remark: value ?? '' })
-    ElMessage.success('故障已关闭')
-    load()
-  } catch (error) {
-    // 用户取消或请求失败, 提示由拦截器处理
-  }
+function openReturn(row) {
+  returnTarget.value = { ...row }
+  returnVisible.value = true
+}
+
+function openClose(row) {
+  closeTarget.value = { ...row }
+  closeVisible.value = true
 }
 
 async function handleDelete(row) {

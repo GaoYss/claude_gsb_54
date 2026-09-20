@@ -14,6 +14,7 @@ import (
 	"streetlight/internal/logging"
 	"streetlight/internal/middleware"
 	"streetlight/internal/module"
+	"streetlight/internal/modules/repair"
 	"streetlight/internal/response"
 )
 
@@ -43,6 +44,11 @@ func New(cfg *config.Config) (*App, error) {
 		models = append(models, item.Models()...)
 	}
 	if err := database.AutoMigrate(db, models); err != nil {
+		return nil, err
+	}
+
+	// 自动迁移完成后创建 AutoMigrate 无法表达的约束索引(如"一灯一条在办维修"的部分唯一索引)。
+	if err := repair.EnsureIndexes(db); err != nil {
 		return nil, err
 	}
 
